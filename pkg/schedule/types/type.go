@@ -76,6 +76,8 @@ const (
 	LabelScheduler CheckerSchedulerType = "label-scheduler"
 	// BalanceRangeScheduler is balance key range scheduler name.
 	BalanceRangeScheduler CheckerSchedulerType = "balance-range-scheduler"
+	// LiveMigrationScheduler is live migration scheduler name.
+	LiveMigrationScheduler CheckerSchedulerType = "live-migration-scheduler"
 )
 
 // TODO: SchedulerTypeCompatibleMap and ConvertOldStrToType should be removed after
@@ -152,6 +154,7 @@ var (
 		"transfer-witness-leader-scheduler": TransferWitnessLeaderScheduler,
 		"label-scheduler":                   LabelScheduler,
 		"balance-range-scheduler":           BalanceRangeScheduler,
+		"live-migration-scheduler":          LiveMigrationScheduler,
 	}
 
 	// DefaultSchedulers is the default scheduler types.

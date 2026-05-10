@@ -640,4 +640,35 @@ func schedulersRegister() {
 		conf.init(sche.GetName(), storage, conf)
 		return sche, nil
 	})
+
+	// TiLiM: live migration scheduler
+	RegisterSliceDecoderBuilder(types.LiveMigrationScheduler, func(args []string) ConfigDecoder {
+		return func(v any) error {
+			conf, ok := v.(*liveMigrationSchedulerConfig)
+			if !ok {
+				return errs.ErrScheduleConfigNotExist.FastGenByArgs()
+			}
+			if len(args) > 0 {
+				conf.Mode = MigrationMode(args[0])
+			}
+			if conf.Mode == "" {
+				conf.Mode = MigrationModeDTCM
+			}
+			return nil
+		}
+	})
+
+	RegisterScheduler(types.LiveMigrationScheduler, func(opController *operator.Controller,
+		storage endpoint.ConfigStorage, decoder ConfigDecoder, _ ...func(string) error) (Scheduler, error) {
+		conf := &liveMigrationSchedulerConfig{
+			baseDefaultSchedulerConfig: newBaseDefaultSchedulerConfig(),
+			Mode:                       MigrationModeDTCM,
+		}
+		if err := decoder(conf); err != nil {
+			return nil, err
+		}
+		sche := newLiveMigrationScheduler(opController, conf)
+		conf.init(sche.GetName(), storage, conf)
+		return sche, nil
+	})
 }
