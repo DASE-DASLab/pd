@@ -390,6 +390,19 @@ func newLiveMigrationScheduler(opController *operator.Controller, conf *liveMigr
 	}
 }
 
+const dtcmPollingInterval = 200 * time.Millisecond
+
+func (s *liveMigrationScheduler) GetNextInterval(interval time.Duration) time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, task := range s.activeTasks {
+		if task.Phase > PhaseIdle && task.Phase < PhaseCompleted {
+			return dtcmPollingInterval
+		}
+	}
+	return s.BaseScheduler.GetNextInterval(interval)
+}
+
 // String returns a human-readable name for the migration phase.
 func (p MigrationPhase) String() string {
 	switch p {
@@ -581,12 +594,30 @@ func (s *liveMigrationScheduler) Schedule(cluster sche.SchedulerCluster, dryRun 
 	}
 	s.pendingTasks = nil
 
-	// --- Advance active DTCM tasks ---
+	// --- Advance active tasks ---
+	var completedNonDtcm []uint64
 	for _, task := range s.activeTasks {
 		if task.Mode == MigrationModeDTCM {
 			taskOps := s.advanceDtcmTask(cluster, task)
 			ops = append(ops, taskOps...)
+		} else {
+			// Non-DTCM: check if leader has moved to target.
+			region := cluster.GetRegion(task.RegionID)
+			if region != nil {
+				leader := region.GetLeader()
+				if leader != nil && leader.GetStoreId() == task.TargetStoreID {
+					task.Phase = PhaseCompleted
+					log.Info("non-DTCM migration completed",
+						zap.Uint64("region", task.RegionID),
+						zap.String("mode", string(task.Mode)),
+						zap.Duration("duration", time.Since(task.StartTime)))
+					completedNonDtcm = append(completedNonDtcm, task.RegionID)
+				}
+			}
 		}
+	}
+	for _, rid := range completedNonDtcm {
+		delete(s.activeTasks, rid)
 	}
 
 	return ops, nil
@@ -867,14 +898,15 @@ func (s *liveMigrationScheduler) advanceDtcmTask(
 
 			task.DtcmState.BacklogSize = sourceBacklog + destLag
 
-			if sourceOk || destOk {
-				log.Debug("DTCM: catchup convergence check",
-					zap.Uint64("region", task.RegionID),
-					zap.Uint64("source_backlog", sourceBacklog),
-					zap.Uint64("source_max_seq", sourceMaxSeq),
-					zap.Uint64("dest_last_applied", destLastApplied),
-					zap.Uint64("dest_lag", destLag))
-			}
+			log.Info("DTCM: catchup convergence check",
+				zap.Uint64("region", task.RegionID),
+				zap.Bool("source_ok", sourceOk),
+				zap.Bool("dest_ok", destOk),
+				zap.Uint64("source_backlog", sourceBacklog),
+				zap.Uint64("source_max_seq", sourceMaxSeq),
+				zap.Uint64("dest_last_applied", destLastApplied),
+				zap.Uint64("dest_lag", destLag),
+				zap.Uint64("backlog_size", sourceBacklog+destLag))
 		}
 		// Convergence requires BOTH source and dest to report successfully.
 		// If either poll failed, we cannot confirm convergence — keep waiting.
@@ -975,6 +1007,17 @@ func (s *liveMigrationScheduler) advanceDtcmTask(
 			}
 		}
 		if task.DtcmState.HandoffBarrierSent && task.DtcmState.DestReady {
+			// Notify source to transition from BARRIER_QUIESCE to HANDOFF_READY
+			// so it will accept the upcoming leader transfer.
+			if task.SourceAddr != "" {
+				payload := map[string]uint64{"region_id": task.RegionID}
+				if err := callTiKVDtcmEndpoint(task.SourceAddr, "/dtcm/complete", payload); err != nil {
+					log.Warn("DTCM: complete source call failed, will retry",
+						zap.Uint64("region", task.RegionID),
+						zap.Error(err))
+					return nil
+				}
+			}
 			task.Phase = PhaseTransferLeader
 			task.PhaseTime = time.Now()
 			log.Info("DTCM: handoff barrier completed and dest ready, advancing to transfer leader",
