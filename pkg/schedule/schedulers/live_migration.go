@@ -43,6 +43,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/tikv/pd/pkg/core"
+	"github.com/tikv/pd/pkg/core/constant"
 	sche "github.com/tikv/pd/pkg/schedule/core"
 	"github.com/tikv/pd/pkg/schedule/operator"
 	"github.com/tikv/pd/pkg/schedule/plan"
@@ -71,8 +72,8 @@ const (
 	PhaseTrackSetup
 	PhaseCatchup
 	PhaseSnapshotBarrier
-	PhaseHandoffBarrier
 	PhasePromoteVoter
+	PhaseHandoffBarrier
 	PhaseTransferLeader
 	PhaseTeardown
 	PhaseCompleted
@@ -158,10 +159,6 @@ type DtcmPDState struct {
 
 	// CompleteSent indicates PD has called /dtcm/complete on source.
 	CompleteSent bool `json:"complete_sent"`
-
-	// UseStandardOperator means DTCM is using the standard MoveLeader
-	// operator (target had no peer), so use non-DTCM completion tracking.
-	UseStandardOperator bool `json:"use_standard_operator"`
 }
 
 // defaultRhoThreshold is the default convergence ratio threshold.
@@ -601,8 +598,7 @@ func (s *liveMigrationScheduler) Schedule(cluster sche.SchedulerCluster, dryRun 
 	// --- Advance active tasks ---
 	var completedNonDtcm []uint64
 	for _, task := range s.activeTasks {
-		useDtcmPhases := task.Mode == MigrationModeDTCM &&
-			(task.DtcmState == nil || !task.DtcmState.UseStandardOperator)
+		useDtcmPhases := task.Mode == MigrationModeDTCM
 		if useDtcmPhases {
 			taskOps := s.advanceDtcmTask(cluster, task)
 			ops = append(ops, taskOps...)
@@ -735,15 +731,29 @@ func (s *liveMigrationScheduler) scheduleDtcm(
 		return nil
 	}
 
-	// When target has no peer, use the same MoveLeader operator as non-DTCM
-	// modes. DTCM behavior is handled by TiKV based on the mode flag.
-	task.DtcmState.UseStandardOperator = true
-	op := s.createMigrationOperator(cluster, region, task)
-	if op == nil {
+	// Target has no peer — create standalone AddLearner operator.
+	// DTCM drives each step independently (AddLearner → Promote → Transfer → Remove).
+	newLearner := &metapb.Peer{
+		StoreId: task.TargetStoreID,
+		Role:    metapb.PeerRole_Learner,
+	}
+	op, err := operator.CreateAddPeerOperator(
+		fmt.Sprintf("tilim-dtcm-add-learner-%d", task.RegionID),
+		cluster, region, newLearner,
+		operator.OpRegion,
+	)
+	if err != nil {
+		log.Warn("DTCM: failed to create add learner operator",
+			zap.Uint64("region", task.RegionID),
+			zap.Error(err))
+		task.Phase = PhaseFailed
 		return nil
 	}
+	op.SetPriorityLevel(constant.Urgent)
 
-	log.Info("DTCM: using standard migration operator (target has no peer)",
+	task.Phase = PhaseAddLearner
+	task.PhaseTime = time.Now()
+	log.Info("DTCM: created add learner operator (target has no peer)",
 		zap.Uint64("region", task.RegionID),
 		zap.Uint64("source", task.SourceStoreID),
 		zap.Uint64("target", task.TargetStoreID))
@@ -762,6 +772,11 @@ func (s *liveMigrationScheduler) advanceDtcmTask(
 	cluster sche.SchedulerCluster,
 	task *MigrationTask,
 ) []*operator.Operator {
+	// Skip if an operator is already running for this region.
+	if s.OpController.GetOperator(task.RegionID) != nil {
+		return nil
+	}
+
 	region := cluster.GetRegion(task.RegionID)
 	if region == nil {
 		log.Warn("DTCM: region disappeared during migration",
@@ -923,10 +938,11 @@ func (s *liveMigrationScheduler) advanceDtcmTask(
 		if converged {
 			if task.DtcmState.SkipSnapshotBarrier {
 				// Fast path: target is existing voter with complete Raft
-				// state. Skip barriers and go straight to TransferLeader.
-				task.Phase = PhaseTransferLeader
+				// state. Skip SnapshotBarrier + PromoteVoter, but MUST run
+				// HandoffBarrier to transfer volatile state.
+				task.Phase = PhaseHandoffBarrier
 				task.PhaseTime = time.Now()
-				log.Info("DTCM: fast path — target is voter, skipping barriers, advancing to transfer leader",
+				log.Info("DTCM: fast path — target is voter, skipping snapshot+promote, advancing to handoff barrier",
 					zap.Uint64("region", task.RegionID))
 			} else {
 				task.Phase = PhaseSnapshotBarrier
@@ -963,8 +979,6 @@ func (s *liveMigrationScheduler) advanceDtcmTask(
 		}
 
 	case PhasePromoteVoter:
-		// With compound operator, promotion is handled automatically.
-		// Wait for the peer to become a voter.
 		peer := region.GetStorePeer(task.TargetStoreID)
 		if peer == nil {
 			if time.Since(task.PhaseTime) > 60*time.Second {
@@ -976,6 +990,18 @@ func (s *liveMigrationScheduler) advanceDtcmTask(
 			return nil
 		}
 		if peer.GetRole() == metapb.PeerRole_Learner {
+			op, err := operator.CreatePromoteLearnerOperator(
+				fmt.Sprintf("tilim-dtcm-promote-%d", task.RegionID),
+				cluster, region, peer,
+			)
+			if err != nil {
+				log.Warn("DTCM: failed to create promote learner operator",
+					zap.Uint64("region", task.RegionID),
+					zap.Error(err))
+			} else {
+				op.SetPriorityLevel(constant.Urgent)
+				return []*operator.Operator{op}
+			}
 			return nil
 		}
 		task.Phase = PhaseHandoffBarrier
@@ -1004,24 +1030,18 @@ func (s *liveMigrationScheduler) advanceDtcmTask(
 			}
 		}
 		if task.DtcmState.HandoffBarrierSent && !task.DtcmState.DestReady {
-			if task.DtcmState.SkipSnapshotBarrier {
-				// Fast path: target is existing voter, already has complete
-				// Raft state — no need to poll dest for handoff readiness.
-				task.DtcmState.DestReady = true
-			} else {
-				// Poll dest status for handoff readiness.
-				status, err := pollTiKVDtcmStatus(task.TargetStatusAddr, task.RegionID)
-				if err == nil {
-					if status.DestHandoffReady != nil && *status.DestHandoffReady {
-						task.DtcmState.DestReady = true
-					}
+			// Poll dest status for handoff readiness.
+			status, err := pollTiKVDtcmStatus(task.TargetStatusAddr, task.RegionID)
+			if err == nil {
+				if status.DestHandoffReady != nil && *status.DestHandoffReady {
+					task.DtcmState.DestReady = true
 				}
 			}
 		}
 		if task.DtcmState.HandoffBarrierSent && task.DtcmState.DestReady {
 			// Notify source to transition from BARRIER_QUIESCE to HANDOFF_READY
 			// so it will accept the upcoming leader transfer.
-			if task.SourceAddr != "" {
+			if task.SourceAddr != "" && !task.DtcmState.CompleteSent {
 				payload := map[string]uint64{"region_id": task.RegionID}
 				if err := callTiKVDtcmEndpoint(task.SourceAddr, "/dtcm/complete", payload); err != nil {
 					log.Warn("DTCM: complete source call failed, will retry",
@@ -1029,6 +1049,7 @@ func (s *liveMigrationScheduler) advanceDtcmTask(
 						zap.Error(err))
 					return nil
 				}
+				task.DtcmState.CompleteSent = true
 			}
 			task.Phase = PhaseTransferLeader
 			task.PhaseTime = time.Now()
@@ -1037,18 +1058,6 @@ func (s *liveMigrationScheduler) advanceDtcmTask(
 		}
 
 	case PhaseTransferLeader:
-		if task.DtcmState != nil && task.SourceAddr != "" && !task.DtcmState.CompleteSent {
-			payload := map[string]uint64{"region_id": task.RegionID}
-			if err := callTiKVDtcmEndpoint(task.SourceAddr, "/dtcm/complete", payload); err != nil {
-				log.Warn("DTCM: complete source call failed, will retry",
-					zap.Uint64("region", task.RegionID),
-					zap.Error(err))
-				return nil
-			}
-			task.DtcmState.CompleteSent = true
-			log.Info("DTCM: notified source handoff complete, creating transfer leader operator",
-				zap.Uint64("region", task.RegionID))
-		}
 		leader := region.GetLeader()
 		if leader != nil && leader.GetStoreId() == task.TargetStoreID {
 			task.Phase = PhaseTeardown
@@ -1056,7 +1065,7 @@ func (s *liveMigrationScheduler) advanceDtcmTask(
 			log.Info("DTCM: leader transferred",
 				zap.Uint64("region", task.RegionID),
 				zap.Uint64("target", task.TargetStoreID))
-		} else if task.DtcmState != nil && task.DtcmState.CompleteSent {
+		} else {
 			op, err := operator.CreateTransferLeaderOperator(
 				fmt.Sprintf("tilim-dtcm-transfer-%d", task.RegionID),
 				cluster,
@@ -1070,6 +1079,7 @@ func (s *liveMigrationScheduler) advanceDtcmTask(
 					zap.Uint64("region", task.RegionID),
 					zap.Error(err))
 			} else {
+				op.SetPriorityLevel(constant.Urgent)
 				return []*operator.Operator{op}
 			}
 		}
@@ -1078,14 +1088,35 @@ func (s *liveMigrationScheduler) advanceDtcmTask(
 		notifyTiKVAbort(task)
 		leader := region.GetLeader()
 		if leader != nil && leader.GetStoreId() == task.TargetStoreID {
-			skipPeerRemoval := task.DtcmState != nil && task.DtcmState.SkipSnapshotBarrier
-			sourcePeer := region.GetStorePeer(task.SourceStoreID)
-			if sourcePeer == nil || skipPeerRemoval {
+			if task.DtcmState != nil && task.DtcmState.SkipSnapshotBarrier {
+				// Fast path: no peer was added, nothing to remove.
 				task.Phase = PhaseCompleted
-				log.Info("DTCM: migration completed",
+				log.Info("DTCM: migration completed (fast path)",
 					zap.Uint64("region", task.RegionID),
 					zap.Duration("duration", time.Since(task.StartTime)))
 				delete(s.activeTasks, task.RegionID)
+			} else {
+				sourcePeer := region.GetStorePeer(task.SourceStoreID)
+				if sourcePeer == nil {
+					task.Phase = PhaseCompleted
+					log.Info("DTCM: migration completed",
+						zap.Uint64("region", task.RegionID),
+						zap.Duration("duration", time.Since(task.StartTime)))
+					delete(s.activeTasks, task.RegionID)
+				} else {
+					op, err := operator.CreateRemovePeerOperator(
+						fmt.Sprintf("tilim-dtcm-remove-%d", task.RegionID),
+						cluster, operator.OpRegion, region, task.SourceStoreID,
+					)
+					if err != nil {
+						log.Warn("DTCM: failed to create remove peer operator",
+							zap.Uint64("region", task.RegionID),
+							zap.Error(err))
+					} else {
+						op.SetPriorityLevel(constant.Urgent)
+						return []*operator.Operator{op}
+					}
+				}
 			}
 		}
 	}
