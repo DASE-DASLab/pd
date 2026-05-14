@@ -31,6 +31,7 @@ import (
 	"github.com/tikv/pd/pkg/errs"
 	sche "github.com/tikv/pd/pkg/schedule/core"
 	"github.com/tikv/pd/pkg/schedule/filter"
+	"github.com/tikv/pd/pkg/schedule/migrationlock"
 	"github.com/tikv/pd/pkg/schedule/operator"
 	"github.com/tikv/pd/pkg/schedule/placement"
 	"github.com/tikv/pd/pkg/schedule/types"
@@ -85,6 +86,12 @@ func (c *RuleChecker) CheckWithFit(region *core.RegionInfo, fit *placement.Regio
 	// checker is paused
 	if c.IsPaused() {
 		ruleCheckerPausedCounter.Inc()
+		return nil
+	}
+	// TiLiM DTCM: skip regions undergoing live migration. Otherwise the
+	// orphan-peer detector would race with PhaseAddLearner→PhaseTransferLeader
+	// and remove the freshly added learner before the migration completes.
+	if migrationlock.IsLocked(region.GetID()) {
 		return nil
 	}
 	// skip no leader region

@@ -28,6 +28,7 @@ import (
 	"github.com/tikv/pd/pkg/errs"
 	"github.com/tikv/pd/pkg/schedule/config"
 	sche "github.com/tikv/pd/pkg/schedule/core"
+	"github.com/tikv/pd/pkg/schedule/migrationlock"
 	"github.com/tikv/pd/pkg/schedule/operator"
 	"github.com/tikv/pd/pkg/schedule/types"
 )
@@ -73,6 +74,10 @@ func (c *ReplicaChecker) Check(region *core.RegionInfo) *operator.Operator {
 	replicaCheckerCounter.Inc()
 	if c.IsPaused() {
 		replicaCheckerPausedCounter.Inc()
+		return nil
+	}
+	// TiLiM DTCM: skip regions undergoing live migration.
+	if migrationlock.IsLocked(region.GetID()) {
 		return nil
 	}
 	if op := c.checkDownPeer(region); op != nil {

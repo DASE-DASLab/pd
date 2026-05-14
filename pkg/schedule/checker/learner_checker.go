@@ -20,6 +20,7 @@ import (
 	"github.com/tikv/pd/pkg/core"
 	"github.com/tikv/pd/pkg/errs"
 	sche "github.com/tikv/pd/pkg/schedule/core"
+	"github.com/tikv/pd/pkg/schedule/migrationlock"
 	"github.com/tikv/pd/pkg/schedule/operator"
 )
 
@@ -40,6 +41,12 @@ func NewLearnerChecker(cluster sche.CheckerCluster) *LearnerChecker {
 func (c *LearnerChecker) Check(region *core.RegionInfo) *operator.Operator {
 	if c.IsPaused() {
 		learnerCheckerPausedCounter.Inc()
+		return nil
+	}
+	// TiLiM DTCM: skip regions undergoing live migration. The DTCM
+	// scheduler manages learner→voter promotion itself via the atomic
+	// swap operator at PhaseTransferLeader.
+	if migrationlock.IsLocked(region.GetID()) {
 		return nil
 	}
 	for _, p := range region.GetLearners() {
